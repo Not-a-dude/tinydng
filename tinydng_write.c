@@ -1068,6 +1068,68 @@ static uint32_t td_wceil(uint32_t a, uint32_t b) {
   return (b == 0u) ? 0u : (a / b) + ((a % b) != 0u);
 }
 
+static void td_add_exif(td_writer *w, const tinydng_exif *exif) { // Vibecoded, DWYOR
+  if (!exif) return;
+
+  // ASCII-strings (TIFF requirement)
+  if (exif->make) {
+    size_t len = strlen(exif->make);
+    td_add(w, TD_TAG_MAKE, TD_TYPE_ASCII, len + 1,
+           (const uint8_t*)exif->make, len + 1);
+  }
+  if (exif->model) {
+    size_t len = strlen(exif->model);
+    td_add(w, TD_TAG_MODEL, TD_TYPE_ASCII, len + 1,
+           (const uint8_t*)exif->model, len + 1);
+  }
+  if (exif->software) {
+    size_t len = strlen(exif->software);
+    td_add(w, TD_TAG_SOFTWARE, TD_TYPE_ASCII, len + 1,
+           (const uint8_t*)exif->software, len + 1);
+  }
+  if (exif->datetime) {
+    size_t len = strlen(exif->datetime);
+    td_add(w, TD_TAG_DATETIME, TD_TYPE_ASCII, len + 1,
+           (const uint8_t*)exif->datetime, len + 1);
+  }
+  if (exif->image_description) {
+    size_t len = strlen(exif->image_description);
+    td_add(w, TD_TAG_IMAGEDESCRIPTION, TD_TYPE_ASCII, len + 1,
+           (const uint8_t*)exif->image_description, len + 1);
+  }
+
+  // Orientation (SHORT)
+  if (exif->orientation != 0) {
+    td_add_short(w, TD_TAG_ORIENTATION, exif->orientation);
+  }
+
+  // Rational numbers: ExposureTime, ApertureValue, ShutterSpeed
+  // (RATIONAL = two LONG: numerator, numerator)
+  if (exif->has_exposure_time) {
+    uint8_t buf[8];
+    td_put32(buf, (uint32_t)exif->exposure_time[0], w->big_endian);
+    td_put32(buf + 4, (uint32_t)exif->exposure_time[1], w->big_endian);
+    td_add(w, TD_TAG_EXPOSURE_TIME, TD_TYPE_RATIONAL, 1, buf, 8);
+  }
+  if (exif->has_aperture_value) {
+    uint8_t buf[8];
+    td_put32(buf, (uint32_t)exif->aperture_value[0], w->big_endian);
+    td_put32(buf + 4, (uint32_t)exif->aperture_value[1], w->big_endian);
+    td_add(w, TD_TAG_APERTURE_VALUE, TD_TYPE_RATIONAL, 1, buf, 8);
+  }
+  if (exif->has_shutter_speed) {
+    uint8_t buf[8];
+    td_put32(buf, (uint32_t)exif->shutter_speed[0], w->big_endian);
+    td_put32(buf + 4, (uint32_t)exif->shutter_speed[1], w->big_endian);
+    td_add(w, TD_TAG_SHUTTER_SPEED_VALUE, TD_TYPE_RATIONAL, 1, buf, 8);
+  }
+
+  // ISO (LONG)
+  if (exif->has_iso) {
+    td_add_long(w, TD_TAG_ISO_SPEED_RATINGS, exif->iso);
+  }
+}
+
 tinydng_status tinydng_writer_create(tinydng_context *ctx,
                                      tinydng_write_io sink,
                                      const tinydng_write_image *meta,
@@ -1359,6 +1421,11 @@ tinydng_status tinydng_writer_create(tinydng_context *ctx,
     td_ctx_free(ctx, w->segs);
     td_ctx_free(ctx, w);
     return TINYDNG_E_INTERNAL;
+  }
+
+  // adding EXIF-metadata
+  if (meta->exif) {
+    td_add_exif(&w->w, meta->exif);
   }
 
   /* Sort entries by tag (TIFF requires ascending). */

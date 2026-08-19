@@ -697,6 +697,7 @@ typedef struct tinydng_write_image {
   size_t data_size;
   const tinydng_cfa *cfa;      /* optional */
   const tinydng_raw_info *raw; /* optional DNG metadata */
+  const tinydng_exif *exif; /* optional EXIF metadata */
 } tinydng_write_image;
 
 /* Serialize `img` to an in-memory TIFF/DNG buffer (allocated via ctx;
