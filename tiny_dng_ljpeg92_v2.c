@@ -8,6 +8,7 @@
 // tdng_lj92_encode() entry point delegates to _ex with components=1,
 // predictor=1.
 
+#include "td_internal.h"
 #include "tiny_dng_ljpeg92_v2.h"
 
 #include <limits.h>
