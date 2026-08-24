@@ -459,6 +459,16 @@ static tinydng_status td_psdw_validate(tinydng_context *ctx,
                  "PSD writer: indexed mode requires a 768-byte palette");
     return TINYDNG_E_INVALID_ARG;
   }
+  if (doc->icc == NULL && doc->icc_size > 0u) {
+    td_set_error(err, TINYDNG_E_INVALID_ARG, TINYDNG_STAGE_WRITE, 0, 0, 0,
+                 "PSD writer: icc_size > 0 with NULL icc pointer");
+    return TINYDNG_E_INVALID_ARG;
+  }
+  if (doc->layer_count > 0u && doc->layers == NULL) {
+    td_set_error(err, TINYDNG_E_INVALID_ARG, TINYDNG_STAGE_WRITE, 0, 0, 0,
+                 "PSD writer: layer_count > 0 with NULL layers");
+    return TINYDNG_E_INVALID_ARG;
+  }
   if (doc->layer_count > ctx->max_psd_layers ||
       doc->layer_count > 32767u) {
     td_set_error(err, TINYDNG_E_INVALID_ARG, TINYDNG_STAGE_WRITE, 0, 0, 0,
@@ -480,6 +490,12 @@ static tinydng_status td_psdw_validate(tinydng_context *ctx,
     if (L->channel_count > 56u) {
       td_set_error(err, TINYDNG_E_INVALID_ARG, TINYDNG_STAGE_WRITE, 0, 0, 0,
                    "PSD writer: layer %zu channel count out of range", i);
+      return TINYDNG_E_INVALID_ARG;
+    }
+    if (L->channel_count > 0u && L->channels == NULL) {
+      td_set_error(err, TINYDNG_E_INVALID_ARG, TINYDNG_STAGE_WRITE, 0, 0, 0,
+                   "PSD writer: layer %zu channel_count > 0 with NULL channels",
+                   i);
       return TINYDNG_E_INVALID_ARG;
     }
     {
@@ -1006,14 +1022,22 @@ tinydng_status tinydng_psd_write_file(tinydng_context *ctx, const char *path,
                  "fopen('%s') for write failed", path);
     return TINYDNG_E_IO;
   }
-  if (fwrite(buf, 1, size, fp) != size) {
-    fclose(fp);
-    td_ctx_free(ctx, buf);
-    td_set_error(err, TINYDNG_E_IO, TINYDNG_STAGE_WRITE, 0, 0, 0,
-                 "short write to '%s'", path);
-    return TINYDNG_E_IO;
+  {
+    int io_ok = (fwrite(buf, 1, size, fp) == size);
+    if (io_ok) {
+      /* Surface a final stdio-buffer flush failure (e.g. ENOSPC) instead of
+       * silently reporting success on a truncated file. */
+      io_ok = (fflush(fp) == 0 && ferror(fp) == 0 && fclose(fp) == 0);
+    } else {
+      fclose(fp);
+    }
+    if (!io_ok) {
+      td_ctx_free(ctx, buf);
+      td_set_error(err, TINYDNG_E_IO, TINYDNG_STAGE_WRITE, 0, 0, 0,
+                   "write to '%s' failed (short write or flush error)", path);
+      return TINYDNG_E_IO;
+    }
   }
-  fclose(fp);
   td_ctx_free(ctx, buf);
   return TINYDNG_OK;
 }

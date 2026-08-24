@@ -1524,6 +1524,19 @@ static tinydng_status td_psd_build_composite(tinydng_context *ctx,
             ((uint64_t)table[4u * i + 1u] << 16) |
             ((uint64_t)table[4u * i + 2u] << 8) | table[4u * i + 3u];
       }
+      /* Fail fast: every row's extent must stay inside the file. A garbled
+       * row length used to be caught only at decode time. */
+      if (running > r->size || n > (r->size - running)) {
+        td_ctx_free(ctx, table);
+        td_ctx_free(ctx, segs);
+        /* Treat as missing composite rather than failing the whole open. */
+        tinydng_error_clear(err);
+        td_ctx_free(ctx, doc->images);
+        doc->images = NULL;
+        doc->image_count = 0;
+        psd->has_composite = 0;
+        return TINYDNG_OK;
+      }
       segs[i].offset = running;
       segs[i].byte_count = n;
       segs[i].index = (uint32_t)i;
@@ -1680,6 +1693,10 @@ typedef struct td_psd_chan_task {
   size_t pixel_stride;  /* bytes between consecutive pixels in dst */
   size_t out_bytes;     /* bytes per output sample (1/2/4) */
   int invert1;          /* 1-bit: emit bit?0:255 */
+  int dst_zero;         /* dst was zero-initialized => samples beyond the
+                           plane's valid prefix are already correct */
+  size_t plane_valid;   /* set by td_psd_load_plane: plane bytes that may
+                           differ from zero (0 = empty, plane_bytes = all) */
   tinydng_error err;
   int ok;
 } td_psd_chan_task;
@@ -1691,6 +1708,7 @@ static uint8_t *td_psd_load_plane(tinydng_context *ctx,
                                   const tinydng_psd_channel *ch, uint32_t w,
                                   uint32_t h, uint16_t depth, int is_psb,
                                   size_t *out_plane_bytes,
+                                  size_t *out_valid,
                                   tinydng_error *err) {
   td_reader r;
   size_t row_bytes, plane_bytes;
@@ -1721,13 +1739,14 @@ static uint8_t *td_psd_load_plane(tinydng_context *ctx,
   if (!plane) {
     return NULL;
   }
+  *out_valid = 0; /* only filled prefixes are reported below */
 
   switch (ch->compression) {
     case TINYDNG_PSD_COMP_RAW: {
       if (ch->data_length == 0u) {
         /* A zero-length channel carries no image bytes; the plane was
            allocated zeroed above, so leave it as all-black. */
-        break;
+        break; /* *out_valid stays 0 */
       }
       size_t copy = ch->data_length;
       if (copy > plane_bytes) {
@@ -1745,6 +1764,7 @@ static uint8_t *td_psd_load_plane(tinydng_context *ctx,
           memcpy(plane, v, copy);
         }
       }
+      *out_valid = copy;
       /* Any tail beyond the channel data length stays zeroed. */
       break;
     }
@@ -1822,6 +1842,7 @@ static uint8_t *td_psd_load_plane(tinydng_context *ctx,
       }
       td_ctx_free(ctx, table);
       td_ctx_free(ctx, rowbuf);
+      *out_valid = plane_bytes; /* every row decoded to exactly row_bytes */
       break;
     }
 #endif /* TINYDNG_NO_PACKBITS */
@@ -1854,6 +1875,7 @@ static uint8_t *td_psd_load_plane(tinydng_context *ctx,
           !td_psd_unpredict_plane(ctx, plane, w, h, depth, err)) {
         goto fail;
       }
+      *out_valid = plane_bytes;
       break;
     }
 #endif /* TINYDNG_NO_ZIP */
@@ -1871,13 +1893,21 @@ fail:
   return NULL;
 }
 
-/* Convert one stored plane to host samples scattered into dst. */
+/* Convert one stored plane to host samples scattered into dst.
+   `max_samples` caps how many destination samples are written: callers
+   scattering onto a pre-zeroed dst may pass the count of samples that can
+   possibly be non-zero (derived from the plane's filled prefix); samples
+   beyond it are zero and dst already holds zeros. Pass 0 to scatter all. */
 static void td_psd_scatter_plane(const uint8_t *plane, uint32_t w, uint32_t h,
                                  uint16_t depth, uint8_t *dst,
-                                 size_t pixel_stride, int invert1) {
+                                 size_t pixel_stride, int invert1,
+                                 size_t max_samples) {
   size_t n_pixels;
   if (!td_safe_mul_size((size_t)w, (size_t)h, &n_pixels)) {
     return;
+  }
+  if (max_samples != 0u && max_samples < n_pixels) {
+    n_pixels = max_samples;
   }
   size_t i;
   if (depth == 8u) {
@@ -1900,7 +1930,11 @@ static void td_psd_scatter_plane(const uint8_t *plane, uint32_t w, uint32_t h,
   } else { /* depth 1: packed MSB-first, rows byte-aligned */
     size_t row_bytes = (size_t)w / 8u + (((size_t)w % 8u) != 0u);
     uint32_t y, x;
-    for (y = 0; y < h; y++) {
+    /* Rows fully beyond the filled prefix cannot hold non-zero bits when
+       the caller pre-zeroed dst; clamp the scanned row count. */
+    uint32_t h_lim = (max_samples != 0u) ? (uint32_t)(max_samples / ((size_t)w ? (size_t)w : 1u)) : h;
+    if (h_lim > h) h_lim = h;
+    for (y = 0; y < h_lim; y++) {
       const uint8_t *rp = plane + (size_t)y * row_bytes;
       uint8_t *dp = dst + (size_t)y * w * pixel_stride;
       for (x = 0; x < w; x++) {
@@ -1916,15 +1950,48 @@ static void td_psd_scatter_plane(const uint8_t *plane, uint32_t w, uint32_t h,
 static void *td_psd_chan_worker(void *p) {
   td_psd_chan_task *t = (td_psd_chan_task *)p;
   size_t plane_bytes = 0;
+  size_t plane_valid = 0;
   uint8_t *plane =
       td_psd_load_plane(t->ctx, t->doc, t->ch, t->w, t->h, t->depth,
-                        t->is_psb, &plane_bytes, &t->err);
+                        t->is_psb, &plane_bytes, &plane_valid, &t->err);
   if (!plane) {
     t->ok = 0;
     return NULL;
   }
-  td_psd_scatter_plane(plane, t->w, t->h, t->depth, t->dst, t->pixel_stride,
-                       t->invert1);
+  t->plane_valid = plane_valid;
+  /* Samples past the plane's filled prefix are zero; on a pre-zeroed dst
+     they need no write at all (huge adjustment-style layers with little or
+     no channel data are legal PSD and would otherwise cost O(w*h)). */
+  {
+    size_t total_samples = (size_t)t->w * (size_t)t->h;
+    /* Plane bytes that can hold a non-zero sample, per stored format:
+       depth 8 -> 1 B/sample, 16 -> 2, 32 -> 4, depth 1 -> 1 bit/sample. */
+    size_t samples_possible;
+    if (t->depth == 1u) {
+      samples_possible = (size_t)(t->plane_valid / 1u) * 8u;
+    } else {
+      size_t eb = (size_t)(t->depth / 8u);
+      if (eb == 0u) {
+        eb = 1u;
+      }
+      samples_possible = t->plane_valid / eb + 1u;
+    }
+    size_t max_samples = total_samples; /* default: scatter everything */
+    if (!t->dst_zero) {
+      max_samples = total_samples; /* caller buffer may be dirty */
+    } else if (t->plane_valid == 0u) {
+      ; /* nothing to write: skip entirely */
+    } else {
+      max_samples = samples_possible + 1u; /* +1 covers the boundary sample */
+      if (max_samples > total_samples) {
+        max_samples = total_samples;
+      }
+    }
+    if (!(t->plane_valid == 0u && t->dst_zero)) {
+      td_psd_scatter_plane(plane, t->w, t->h, t->depth, t->dst,
+                           t->pixel_stride, t->invert1, max_samples);
+    }
+  }
   td_ctx_free(t->ctx, plane);
   t->ok = 1;
   return NULL;
@@ -2049,40 +2116,52 @@ tinydng_status tinydng_psd_decode_layer(tinydng_context *ctx,
   }
 
   /* Build one task per decodable channel. Slot for id>=0 is its rank among
-     the non-negative ids (ids are almost always 0..n-1). */
-  for (i = 0; i < L->channel_count; i++) {
-    const tinydng_psd_channel *ch = &L->channels[i];
-    size_t slot, j;
-    if (ch->id < -1) {
-      continue; /* masks are not part of the interleaved output */
-    }
-    if (ch->id == -1) {
-      slot = alpha_slot;
-    } else {
-      slot = 0;
-      for (j = 0; j < L->channel_count; j++) {
-        if (L->channels[j].id >= 0 && L->channels[j].id < ch->id) {
-          slot++;
+     the non-negative ids (ids are almost always 0..n-1). A crafted file may
+     declare duplicate ids (or duplicate alpha channels); two tasks writing
+     the same output slot would race under threaded decode, so only the first
+     channel claiming a slot is queued. */
+  {
+    uint8_t slot_used[TD_PSD_MAX_LAYER_CHANNELS];
+    memset(slot_used, 0, sizeof(slot_used));
+    for (i = 0; i < L->channel_count; i++) {
+      const tinydng_psd_channel *ch = &L->channels[i];
+      size_t slot, j;
+      if (ch->id < -1) {
+        continue; /* masks are not part of the interleaved output */
+      }
+      if (ch->id == -1) {
+        slot = alpha_slot;
+      } else {
+        slot = 0;
+        for (j = 0; j < L->channel_count; j++) {
+          if (L->channels[j].id >= 0 && L->channels[j].id < ch->id) {
+            slot++;
+          }
         }
       }
+      if (slot >= spp || slot_used[slot]) {
+        continue;
+      }
+      slot_used[slot] = 1;
+      tasks[n_tasks].ctx = ctx;
+      tasks[n_tasks].doc = doc;
+      tasks[n_tasks].ch = ch;
+      tasks[n_tasks].w = L->width;
+      tasks[n_tasks].h = L->height;
+      tasks[n_tasks].depth = psd->depth;
+      tasks[n_tasks].is_psb = psd->is_psb;
+      tasks[n_tasks].dst = dst + slot * out_bytes;
+      tasks[n_tasks].pixel_stride = pixel_stride;
+      tasks[n_tasks].out_bytes = out_bytes;
+      tasks[n_tasks].invert1 = 1;
+      /* dst comes from td_ctx_calloc when the library owns it; a caller
+         buffer may be uninitialized, so only zero-planes onto owned dst
+         are skippable. */
+      tasks[n_tasks].dst_zero = owns;
+      tinydng_error_clear(&tasks[n_tasks].err);
+      tasks[n_tasks].ok = 0;
+      n_tasks++;
     }
-    if (slot >= spp) {
-      continue;
-    }
-    tasks[n_tasks].ctx = ctx;
-    tasks[n_tasks].doc = doc;
-    tasks[n_tasks].ch = ch;
-    tasks[n_tasks].w = L->width;
-    tasks[n_tasks].h = L->height;
-    tasks[n_tasks].depth = psd->depth;
-    tasks[n_tasks].is_psb = psd->is_psb;
-    tasks[n_tasks].dst = dst + slot * out_bytes;
-    tasks[n_tasks].pixel_stride = pixel_stride;
-    tasks[n_tasks].out_bytes = out_bytes;
-    tasks[n_tasks].invert1 = 1;
-    tinydng_error_clear(&tasks[n_tasks].err);
-    tasks[n_tasks].ok = 0;
-    n_tasks++;
   }
   if (n_tasks == 0u) {
     if (owns) {
@@ -2172,7 +2251,8 @@ tinydng_status tinydng_psd_decode_layer_channel(
     }
     dst = (uint8_t *)opts->dst;
   } else {
-    dst = (uint8_t *)td_ctx_alloc(ctx, total, err);
+    /* calloc so an all-zero channel plane may skip the scatter loop. */
+    dst = (uint8_t *)td_ctx_calloc(ctx, total, err);
     if (!dst) {
       return TINYDNG_E_OOM;
     }
@@ -2189,6 +2269,7 @@ tinydng_status tinydng_psd_decode_layer_channel(
   task.pixel_stride = out_bytes;
   task.out_bytes = out_bytes;
   task.invert1 = 1;
+  task.dst_zero = owns;
   tinydng_error_clear(&task.err);
   task.ok = 0;
   td_psd_chan_worker(&task);
@@ -2217,6 +2298,37 @@ tinydng_status tinydng_psd_decode_layer_channel(
 /* Thumbnail                                                          */
 /* ------------------------------------------------------------------ */
 
+#ifndef TINYDNG_NO_BASELINE_JPEG
+/* Decompression-bomb guard for stb_image payloads: stb allocates through
+ * libc malloc, outside the tracked allocator and its memory cap. Probe the
+ * header and reject images whose decoded 8-bit size (w*h*channels) cannot
+ * fit the remaining memory budget. Returns 1 to proceed, 0 when rejected. */
+static int td_psd_stb_budget_ok(tinydng_context *ctx, const uint8_t *data,
+                                int data_len, unsigned desired) {
+  int w = 0, h = 0, comp = 0;
+  uint64_t channels, need, budget;
+  td_mutex *L;
+  if (!stbi_info_from_memory(data, data_len, &w, &h, &comp)) {
+    return 1; /* header already broken: stbi_load reports the real error */
+  }
+  if (w <= 0 || h <= 0) {
+    return 0;
+  }
+  channels = (desired > 0u) ? (uint64_t)desired : (uint64_t)(unsigned)comp;
+  if (!td_safe_mul_u64((uint64_t)(uint32_t)w, (uint64_t)(uint32_t)h, &need) ||
+      !td_safe_mul_u64(need, channels, &need)) {
+    return 0;
+  }
+  /* Same lock discipline as the tracked allocator (MT decode). */
+  L = ctx->mt_active ? ctx->lock : NULL;
+  td_mutex_lock(L);
+  budget = ctx->memory_cap_bytes ? (ctx->memory_cap_bytes - ctx->memory_used)
+                                 : UINT64_MAX;
+  td_mutex_unlock(L);
+  return need <= budget;
+}
+#endif
+
 tinydng_status tinydng_psd_decode_thumbnail(tinydng_context *ctx,
                                             const tinydng_document *doc,
                                             tinydng_pixels *out,
@@ -2231,8 +2343,7 @@ tinydng_status tinydng_psd_decode_thumbnail(tinydng_context *ctx,
   tinydng_error_clear(err);
   if (!ctx || !doc || !out) {
     return TINYDNG_E_INVALID_ARG;
-  }
-  memset(out, 0, sizeof(*out));
+  }  memset(out, 0, sizeof(*out));
   psd = tinydng_document_psd(doc);
   if (!psd) {
     return TINYDNG_E_INVALID_ARG;
@@ -2280,6 +2391,15 @@ tinydng_status tinydng_psd_decode_thumbnail(tinydng_context *ctx,
     jbuf = td_psd_read_copy(ctx, &r, res->offset + 28u, jlen, err);
     if (!jbuf) {
       return td_error_status_or(err, TINYDNG_E_OOM);
+    }
+    /* The embedded JPEG's own header governs the allocation; reject bombs
+     * regardless of the (already capped) tw/th resource fields. */
+    if (!td_psd_stb_budget_ok(ctx, jbuf, (int)jlen, 3u)) {
+      td_ctx_free(ctx, jbuf);
+      td_set_error(err, TINYDNG_E_BOUNDS, TINYDNG_STAGE_DECODE, 0, 0,
+                   res->offset, "PSD: thumbnail decoded size exceeds memory "
+                                "budget");
+      return TINYDNG_E_BOUNDS;
     }
     pixels = stbi_load_from_memory(jbuf, (int)jlen, &w, &h, &comp, 3);
     td_ctx_free(ctx, jbuf);
@@ -2528,6 +2648,13 @@ tinydng_status tinydng_psd_smart_object_decode(tinydng_context *ctx,
                                 &payload, &payload_size, err);
     if (st != TINYDNG_OK) {
       return st;
+    }
+    if (!td_psd_stb_budget_ok(ctx, payload, (int)payload_size, 0u)) {
+      td_ctx_free(ctx, payload);
+      td_set_error(err, TINYDNG_E_BOUNDS, TINYDNG_STAGE_DECODE, 0, 0,
+                   so->data_offset,
+                   "PSD: smart object decoded size exceeds memory budget");
+      return TINYDNG_E_BOUNDS;
     }
     pixels = stbi_load_from_memory(payload, (int)payload_size, &w, &h, &comp,
                                    0);

@@ -54,7 +54,9 @@ struct tinydng_context {
   uint32_t max_embed_depth;
   td_alloc_header *alloc_head;
   int alloc_failed;
-  td_mutex *lock;  /* guards allocator + stdio reads while mt_active (may be NULL) */
+  td_mutex* lock;    /* guards allocator state while mt_active (may be NULL) */
+  td_mutex* io_lock; /* guards non-positional stdio reads while mt_active (may
+                        be NULL) */
   int mt_active;   /* set only for the duration of a multi-threaded decode */
   td_mutex *decode_guard; /* serializes overlapping decodes on this ctx (recursive) */
 };
@@ -175,6 +177,21 @@ int td_r_val_uint(const td_reader *r, uint16_t type, uint64_t at,
                   uint64_t *out);
 int td_r_val_int(const td_reader *r, uint16_t type, uint64_t at, int64_t *out);
 int td_r_val_real(const td_reader *r, uint16_t type, uint64_t at, double *out);
+
+/* Bulk array reads: one io_view over the whole span (zero-copy when the io
+   is mapped; a single read otherwise), then per-element conversion from the
+   buffer. Return elements converted; 0 on bounds/size failure.
+   `scratch` must hold span bytes when the io has no map. */
+const uint8_t* td_bulk_span_view(const td_reader* r, uint64_t off, size_t bytes,
+                                 const uint8_t* scratch, size_t scratch_cap);
+size_t td_uints_from_buf(const uint8_t* p, uint16_t type, int big_endian,
+                         size_t n, uint64_t* out);
+/* Single-element converters over an already-fetched byte span. */
+int td_val_uint_buf(const uint8_t* p, uint16_t type, int big_endian,
+                    uint64_t* out);
+float td_f32_from_buf(const uint8_t* p, int big_endian);
+size_t td_reals_from_buf(const uint8_t* p, uint16_t type, int big_endian,
+                         size_t n, double* out);
 
 /* ------------------------------------------------------------------ */
 /* TIFF data types                                                    */
@@ -319,11 +336,13 @@ long td_packbits_decode(const uint8_t *in, size_t in_len, uint8_t *out,
 /* PSD / PSB (tinydng_psd.c, tinydng_psd_write.c)                     */
 /* ------------------------------------------------------------------ */
 
-#ifndef TINYDNG_NO_PSD
-
 /* Internal-only compression code for the composite segment table: zlib +
-   per-row delta prediction. Never collides with TIFF compression tags. */
+   per-row delta prediction. Never collides with TIFF compression tags. Keep
+   this visible in decode-only builds because shared codec dispatch compares
+   compression values against it even when PSD support is compiled out. */
 #define TD_COMPRESSION_PSD_ZIP_PRED 0xF003u
+
+#ifndef TINYDNG_NO_PSD
 
 /* Parse a PSD/PSB stream (magic already verified) and populate `doc`:
    doc->psd plus doc->images[0] for the composite. `r` is positioned on the

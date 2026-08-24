@@ -684,6 +684,9 @@ typedef struct tinydng_write_options {
   uint8_t big_endian;   /* 0 => little-endian */
   uint8_t as_dng;       /* emit DNG-specific tags from `raw`/`cfa`     */
   uint8_t bigtiff;      /* emit BigTIFF (version 43, 8-byte offsets)   */
+  uint8_t ljpeg_arithmetic; /* compression=7: SOF11 instead of SOF3   */
+  uint8_t ljpeg_predictor;  /* 0 => 1; otherwise Annex H selector 1..7 */
+  uint16_t ljpeg_restart_interval_mcus; /* 0 => none; whole MCU rows   */
   uint16_t compression; /* 0/1 none, 5 LZW, 7 lossless JPEG, 32773 PackBits */
 } tinydng_write_options;
 
@@ -743,6 +746,8 @@ tinydng_status tinydng_write_io_open_file(tinydng_context *ctx,
                                           const char *path,
                                           tinydng_write_io *out,
                                           tinydng_error *err);
+/* Note: open_file creates/truncates the destination immediately ("w+b");
+   a failed write leaves a partial file behind. */
 tinydng_status tinydng_write_io_open_memory(tinydng_context *ctx,
                                             tinydng_write_io *out,
                                             tinydng_error *err);
@@ -763,7 +768,10 @@ typedef struct tinydng_tiling {
 typedef struct tinydng_writer tinydng_writer;
 
 /* Create a streaming writer. `meta` supplies the geometry + DNG metadata;
-   meta->data/data_size are ignored (pixels arrive per tile/strip). */
+   meta->data/data_size are ignored (pixels arrive per tile/strip).
+   On failure the sink is NOT closed (the caller keeps ownership); on
+   success tinydng_writer_finish releases writer state but the sink still
+   needs io.close() from the caller. */
 tinydng_status tinydng_writer_create(tinydng_context *ctx,
                                      tinydng_write_io sink,
                                      const tinydng_write_image *meta,
