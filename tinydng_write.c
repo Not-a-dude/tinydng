@@ -1502,7 +1502,7 @@ tinydng_status tinydng_writer_create(tinydng_context *ctx,
   if (opts && opts->as_dng) {
     const tinydng_raw_info *raw = meta->raw;
     const tinydng_cfa *cfa = meta->cfa;
-    td_add_short(&w->w, TD_TAG_NEW_SUBFILE_TYPE, 0);
+    td_add_long(&w->w, TD_TAG_NEW_SUBFILE_TYPE, 0);
     if (cfa && cfa->present) {
       uint16_t dim[2];
       dim[0] = cfa->pattern_dim[0] ? cfa->pattern_dim[0] : 2u;
